@@ -1,0 +1,8 @@
+node_modules/
+dist/
+native/bin/
+artifacts/
+*.tgz
+.DS_Store
+.env
+docs/github-landscape.md
