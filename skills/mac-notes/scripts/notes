@@ -1,0 +1,684 @@
+#!/usr/bin/env osascript -l JavaScript
+//
+// notes — 零依赖操控 macOS 备忘录 (Apple Notes) 的 agent CLI
+//
+// 用法:   notes <command> [options]        (notes help 查看全部命令)
+// 输出:   成功 = JSON (stdout, exit 0);  失败 = [mac-notes] 开头的信息 (stderr, exit 1)
+// 依赖:   无 (macOS 自带 osascript / JXA)
+//
+// 原理说明见同目录 ../references/quirks.md:
+//  - 搜索用「一次 Apple Event 批量拉属性 + JS 过滤」, 不用 whose 子句
+//    (whose 对新建笔记会报「不能获取对象」, 且实测更慢)
+//  - 标题 = 正文第一行: rename 通过改写 body 首个 <div> 实现, name 会自动同步
+//
+
+'use strict';
+
+function run(argv) {
+  const USAGE = `
+notes — 操控 macOS 备忘录 (Apple Notes), 零依赖, 输出 JSON
+
+用法: notes <command> [options]
+
+搜索 / 读取
+  notes folders [--all]                     文件夹列表 (path, noteCount; 默认不含「最近删除」)
+  notes list [--folder F] [--limit N]       笔记列表, 按修改时间倒序 (默认前 50 条)
+  notes search <关键词> [--folder F] [--deleted] [--limit N]
+                                            全文搜索 (标题+正文, 不区分大小写), 返回摘要
+  notes show <id|标题> [--html]             读一条笔记 (默认纯文本; --html 附原始 HTML)
+  notes open <id|标题>                       在备忘录 App 中打开并定位该笔记
+
+撰写
+  notes create --title "T" [--text "内容"] [--folder F]
+                                            新建笔记 (标题会自动成为正文第一行, --text 里不要再写标题)
+  notes append <id|标题> --text "内容"       在笔记末尾追加段落
+  notes set-text <id|标题> --text "内容"     整体替换正文 (保留标题)
+  notes apply-markdown <id|标题> (--file F|--text M) [--append]
+                                            把 Markdown 转成备忘录富文本写入
+                                            (真表格/原生虚线列表/标题样式/加粗, 保留原标题)
+  notes rename <id|标题> --title "新标题"
+
+导出 (Obsidian 格式)
+  notes export <id|标题> [--out 目录]      单篇导出为 .md (frontmatter + Markdown)
+  notes export --folder F [--out 目录]     批量导出整个文件夹 (含子文件夹)
+
+整理
+  notes mkdir <路径>                         创建文件夹 (支持 "父/子" 嵌套路径)
+  notes move <id|标题> --folder F            移动笔记到文件夹
+  notes delete <id|标题>                     删除笔记 → 移入「最近删除」(30 天)
+  notes delete-folder <路径|id> [--force]    删除文件夹; 非空时需 --force
+
+通用
+  --account <名称>    指定账户 (默认自动选 iCloud)
+  notes help          本帮助
+
+提示: 所有 <id|标题> 参数优先用 id (list/search/show 会返回); 标题唯一时可直接用标题。
+`.trim();
+
+  const cmd = argv[0];
+  const rest = argv.slice(1);
+  if (!cmd || cmd === 'help' || cmd === '--help' || cmd === '-h') return USAGE;
+
+  // ---------- 参数解析 ----------
+  const BOOL_FLAGS = new Set(['--all', '--deleted', '--html', '--force', '--append']);
+  function parse(args, valueFlags) {
+    const o = { _: [] };
+    for (let i = 0; i < args.length; i++) {
+      const a = args[i];
+      if (valueFlags.has(a)) {
+        if (i + 1 >= args.length) throw `[mac-notes] ${a} 需要一个值`;
+        o[a] = args[++i];
+      } else if (BOOL_FLAGS.has(a)) {
+        o[a] = true;
+      } else if (a.startsWith('--')) {
+        throw `[mac-notes] 未知参数: ${a} (运行 notes help 查看)`;
+      } else {
+        o._.push(a);
+      }
+    }
+    return o;
+  }
+
+  // ---------- 连接 (尽早暴露授权问题) ----------
+  let App;
+  try {
+    App = Application('Notes');
+    App.accounts();
+  } catch (e) {
+    const m = String(e.message);
+    if (/-1743|authoriz|appleevent|权限/i.test(m)) {
+      throw `[mac-notes] 没有控制「备忘录」的权限。请打开 系统设置 → 隐私与安全性 → 自动化, 允许你的终端 App (ZCode / Terminal / iTerm 等) 控制备忘录, 然后重试。 (${m})`;
+    }
+    throw `[mac-notes] 连接备忘录失败: ${m}`;
+  }
+
+  // ---------- 账户 ----------
+  function account(name) {
+    const accts = App.accounts();
+    const names = accts.map(a => a.name());
+    if (!names.length) throw '[mac-notes] 备忘录中没有账户 (未登录 iCloud 且未启用「我的 Mac 上」账户)。';
+    if (!name) {
+      const i = names.findIndex(n => /icloud/i.test(n));
+      return accts[i >= 0 ? i : 0];
+    }
+    const i = names.indexOf(name);
+    if (i < 0) throw `[mac-notes] 账户不存在: ${name} (可用: ${names.join(', ')})`;
+    return accts[i];
+  }
+
+  // ---------- 文件夹数据 (一次批量拉取) ----------
+  function folderData(acct) {
+    const specs = acct.folders();
+    const names = acct.folders.name();
+    const ids = acct.folders.id();
+    const byId = new Map();
+    const specById = new Map();
+    const list = names.map((name, i) => {
+      const f = { name: String(name), id: String(ids[i]), parentId: null, noteCount: 0 };
+      byId.set(f.id, f);
+      specById.set(f.id, specs[i]);
+      return f;
+    });
+    for (let i = 0; i < list.length; i++) {
+      try { list[i].parentId = specs[i].container().id(); } catch (e) { /* 父已被删的孤儿文件夹 */ }
+      try { list[i].noteCount = specs[i].notes.length; } catch (e) {}
+    }
+    for (const f of list) {
+      const segs = [f.name];
+      let cur = f, guard = 0;
+      while (cur.parentId && byId.has(cur.parentId) && guard++ < 30) {
+        cur = byId.get(cur.parentId);
+        segs.unshift(cur.name);
+      }
+      f.path = segs.join('/');
+      f.inTrash = f.name === 'Recently Deleted' || f.path.startsWith('Recently Deleted/');
+      f.depth = segs.length - 1;
+    }
+    return { list, byId, specById };
+  }
+
+  // 子树匹配: folderPath 为空 = 全部
+  function inScope(path, folderPath) {
+    return !folderPath || path === folderPath || path.startsWith(folderPath + '/');
+  }
+
+  // ---------- 笔记收集 (每文件夹一次批量拉取) ----------
+  function collectNotes(acct, { folderPath = null, includeDeleted = false, withText = false } = {}) {
+    const { list, specById } = folderData(acct);
+    const targets = list.filter(f => (includeDeleted || !f.inTrash) && inScope(f.path, folderPath));
+    const notes = [];
+    for (const f of targets) {
+      const fspec = specById.get(f.id);
+      let ids = [];
+      try { ids = fspec.notes.id().map(String); } catch (e) { continue; }
+      if (!ids.length) continue;
+      // 批量取属性; 整批失败 (如锁定笔记) 时逐条兜底
+      const safeBatch = (prop, fallback) => {
+        try {
+          return Array.from(fspec.notes[prop]());
+        } catch (e) {
+          const nspecs = fspec.notes();
+          return nspecs.map(s => { try { return s[prop](); } catch (e2) { return fallback; } });
+        }
+      };
+      const names = safeBatch('name', '?');
+      const created = safeBatch('creationDate', null);
+      const modified = safeBatch('modificationDate', null);
+      const locked = safeBatch('passwordProtected', false);
+      const texts = withText ? safeBatch('plaintext', '') : null;
+      ids.forEach((id, i) => notes.push({
+        id,
+        name: String(names[i]),
+        folder: f.path,
+        folderId: f.id,
+        created: created[i] ? new Date(created[i]).toISOString() : null,
+        modified: modified[i] ? new Date(modified[i]).toISOString() : null,
+        locked: !!locked[i],
+        text: withText ? String(texts[i]) : undefined,
+      }));
+    }
+    return notes;
+  }
+
+  // ---------- 定位单条笔记: 优先 id, 否则标题精确匹配 ----------
+  function findNote(acct, idOrTitle, { includeDeleted = false } = {}) {
+    const key = String(idOrTitle);
+    const { specById } = folderData(acct);
+    const all = collectNotes(acct, { includeDeleted: true });
+    let hits = [];
+    if (key.startsWith('x-coredata://')) {
+      hits = all.filter(n => n.id === key);
+      if (!hits.length) throw `[mac-notes] id 不存在: ${key}`;
+    } else {
+      const notTrash = n => !(n.folder === 'Recently Deleted' || n.folder.startsWith('Recently Deleted/'));
+      const live = all.filter(n => (includeDeleted || notTrash(n)) && n.name.toLowerCase() === key.toLowerCase());
+      if (!live.length) {
+        const near = all.filter(n => notTrash(n) && n.name.toLowerCase().includes(key.toLowerCase())).slice(0, 8);
+        throw `[mac-notes] 找不到笔记「${key}」。${near.length ? '标题相近的有:\n' + near.map(n => `  - ${n.name}  [${n.folder}]  id=${n.id}`).join('\n') : '可用 search 命令做全文搜索。'}`;
+      }
+      hits = live;
+    }
+    if (hits.length > 1) {
+      throw `[mac-notes] 有 ${hits.length} 条同名笔记「${key}」, 请改用 id 指定:\n` + hits.map(n => `  - [${n.folder}]  id=${n.id}`).join('\n');
+    }
+    const h = hits[0];
+    return { spec: specById.get(h.folderId).notes.byId(h.id), meta: h };
+  }
+
+  // ---------- 定位文件夹 ----------
+  function resolveFolder(acct, path) {
+    const { list, specById } = folderData(acct);
+    const exact = list.find(f => !f.inTrash && f.path === path);
+    if (exact) return { path: exact.path, spec: specById.get(exact.id) };
+    const loose = list.filter(f => !f.inTrash && f.name === path);
+    if (loose.length === 1) return { path: loose[0].path, spec: specById.get(loose[0].id) };
+    if (loose.length > 1) throw `[mac-notes] 文件夹名「${path}」不唯一, 请用完整路径: ${loose.map(f => f.path).join(' | ')}`;
+    throw `[mac-notes] 文件夹不存在: ${path} (可先 mkdir 创建; 用 folders 命令查看全部)`;
+  }
+
+  function defaultNotesFolder(acct) {
+    const { list, specById } = folderData(acct);
+    const f = list.find(x => !x.inTrash && x.depth === 0 && x.name === 'Notes')
+           || list.find(x => !x.inTrash && x.depth === 0);
+    if (!f) throw '[mac-notes] 找不到默认文件夹 (账户根目录为空)。';
+    return { path: f.path, spec: specById.get(f.id) };
+  }
+
+  // ---------- HTML 辅助 ----------
+  const esc = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const textToHtml = s => String(s)
+    .split(/\r?\n/)
+    .map(l => l.trim() === '' ? '<div><br></div>' : '<div>' + esc(l) + '</div>')
+    .join('\n');
+  function splitTitle(bodyHtml) {
+    const s = String(bodyHtml);
+    const m = s.match(/^\s*<div[^>]*>[\s\S]*?<\/div>/);
+    return m ? { head: m[0], rest: s.slice(m[0].length) } : { head: '', rest: s };
+  }
+
+  // ---------- Markdown → 备忘录富文本 HTML ----------
+  // 方言 (2026-10 实测, 详见 references/quirks.md):
+  //   表格 = <div><object><table>+内联边框样式; 列表 = <ul class="Apple-dash-list">
+  //   标题样式无语义 API, 用 粗体+字号 模拟 (h1→22px, h2→18px, h3+→粗体)
+  //   原生可打勾清单无法通过 body 写入产生, - [ ] 转为普通列表项, [x] 加 ✓ 前缀
+  function inlineMd(s) {
+    let t = esc(s);
+    t = t.replace(/\*\*([^*]+)\*\*/g, '<b>$1</b>');
+    t = t.replace(/`([^`]+)`/g, '<tt>$1</tt>');
+    t = t.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '$1 ($2)');
+    return t;
+  }
+  const TD_STYLE = 'border-style: solid; border-width: 1.0px 1.0px 1.0px 1.0px; border-color: #ccc; padding: 3.0px 5.0px 3.0px 5.0px; min-width: 70px';
+  function tableHtml(rows) {
+    const trs = rows.map((cells, ri) => '<tr>' + cells.map(c =>
+      '<td valign="top" style="' + TD_STYLE + '"><div>' + (ri === 0 ? '<b>' + inlineMd(c) + '</b>' : inlineMd(c)) + '</div></td>'
+    ).join('') + '</tr>');
+    return '<div><object><table cellspacing="0" cellpadding="0" style="border-collapse: collapse; direction: ltr"><tbody>'
+      + trs.join('') + '</tbody></table></object></div>';
+  }
+  function mdToHtml(md, titleToSkip) {
+    const lines = String(md).replace(/\r\n?/g, '\n').split('\n');
+    let i = 0;
+    if (lines[0] && lines[0].trim() === '---') {           // 跳过 YAML frontmatter
+      for (i = 1; i < lines.length; i++) if (lines[i].trim() === '---') { i++; break; }
+    }
+    const out = [];
+    let listItems = null, tableRows = null, skippedTitle = false;
+    const flushList = () => { if (listItems) { out.push('<ul class="Apple-dash-list">' + listItems.map(x => '<li>' + x + '</li>').join('\n') + '</ul>'); listItems = null; } };
+    const flushTable = () => { if (tableRows) { out.push(tableHtml(tableRows)); tableRows = null; } };
+    for (; i < lines.length; i++) {
+      const s = lines[i].trim();
+      let m = s.match(/^(?:[-*+]|\d+[.)])\s+(.*)$/);       // 列表项 (含任务列表/有序列表)
+      if (m) {
+        flushTable();
+        let item = m[1];
+        const cb = item.match(/^\[([ xX])\]\s*(.*)$/);
+        if (cb) item = (cb[1] === ' ' ? '' : '✓ ') + cb[2];
+        (listItems = listItems || []).push(inlineMd(item));
+        continue;
+      }
+      if (/^\|.*\|$/.test(s)) {                            // 表格行
+        flushList();
+        const cells = s.slice(1, -1).split('|').map(c => c.trim());
+        if (cells.every(c => /^:?-{2,}:?$/.test(c))) continue;
+        (tableRows = tableRows || []).push(cells);
+        continue;
+      }
+      flushList(); flushTable();
+      if (!s) { out.push('<div><br></div>'); continue; }
+      m = s.match(/^(#{1,6})\s+(.*)$/);                    // 标题
+      if (m) {
+        const level = m[1].length, text = m[2].trim();
+        if (level === 1 && !skippedTitle && text === titleToSkip) { skippedTitle = true; continue; }
+        const t = inlineMd(text);
+        out.push(level === 1 ? '<div><b><span style="font-size: 22px">' + t + '</span></b></div>'
+               : level === 2 ? '<div><b><span style="font-size: 18px">' + t + '</span></b></div>'
+               : '<div><b>' + t + '</b></div>');
+        continue;
+      }
+      if (/^(---+|\*\*\*+|___+)$/.test(s)) { out.push('<div>⸻</div>'); continue; }
+      out.push('<div>' + inlineMd(s) + '</div>');
+    }
+    flushList(); flushTable();
+    return out.join('\n');
+  }
+  function readMdFile(p) {
+    let path = String(p);
+    if (path.startsWith('~/')) path = $.NSHomeDirectory().js + path.slice(1);
+    // 显式 UTF-8: StandardAdditions.read 会用系统默认编码读, 中文会乱码
+    try {
+      const s = $.NSString.stringWithContentsOfFileEncodingError(path, $.NSUTF8StringEncoding, null);
+      return s.js;
+    } catch (e) { throw '[mac-notes] 读取文件失败: ' + path; }
+  }
+
+  // ---------- 备忘录富文本 HTML → Markdown (export 用, 方言见 quirks.md) ----------
+  const unescHtml = s => String(s).replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&amp;/g, '&');
+  function inlineFromHtml(h) {
+    let t = String(h);
+    t = t.replace(/<\/?font[^>]*>/g, '').replace(/<\/?span[^>]*>/g, '').replace(/<br\s*\/?>/g, ' ');
+    t = t.replace(/<b>([\s\S]*?)<\/b>/g, '**$1**');
+    t = t.replace(/\*\*\*\*/g, '');                                  // 相邻 b 段合并
+    t = t.replace(/<tt>([\s\S]*?)<\/tt>/g, '`$1`');
+    t = unescHtml(t.replace(/<[^>]+>/g, ''));
+    return t.replace(/\s+/g, ' ').trim();
+  }
+  function tableToMd(html) {
+    const rows = [];
+    let m, re = /<tr[^>]*>([\s\S]*?)<\/tr>/g;
+    while ((m = re.exec(html))) {
+      const cells = [];
+      let c, cre = /<td[^>]*>([\s\S]*?)<\/td>/g;
+      while ((c = cre.exec(m[1]))) cells.push(inlineFromHtml(c[1]).replace(/\|/g, '\\|') || ' ');
+      if (cells.length) rows.push(cells);
+    }
+    if (!rows.length) return '';
+    rows[0] = rows[0].map(c => c.replace(/\*\*/g, ''));               // 表头去加粗
+    const width = Math.max(...rows.map(r => r.length));
+    const line = r => '| ' + r.join(' | ') + ' |';
+    const out = [line(rows[0]), '| ' + Array(width).fill('---').join(' | ') + ' |'];
+    for (let i = 1; i < rows.length; i++) out.push(line(rows[i]));
+    return out.join('\n');
+  }
+  // 顶层块扫描: 表格(object) 优先, 其次 ul, 最后非嵌套 div (方言中顶层 div 不嵌套)
+  function htmlToMd(body, title) {
+    const s = String(body);
+    const re = /<div[^>]*><object>[\s\S]*?<\/object>(?:<br\s*\/?>)?<\/div>|<ul[^>]*>[\s\S]*?<\/ul>|<div[^>]*>[\s\S]*?<\/div>/g;
+    const out = [];
+    let m, firstDivSkipped = false;
+    while ((m = re.exec(s))) {
+      const b = m[0];
+      if (b.includes('<object>')) { out.push(tableToMd(b)); continue; }
+      if (b.startsWith('<ul')) {
+        let li, lire = /<li[^>]*>([\s\S]*?)<\/li>/g;
+        while ((li = lire.exec(b))) out.push('- ' + inlineFromHtml(li[1]));
+        out.push('');
+        continue;
+      }
+      const inner = b.replace(/^<div[^>]*>/, '').replace(/<\/div>$/, '');
+      if (!firstDivSkipped) { firstDivSkipped = true; continue; }   // 首个 div = 标题, 已在 frontmatter
+      if (/font-size:\s*22px/.test(b)) { out.push('# ' + inlineFromHtml(inner.replace(/<\/?b>/g, ''))); out.push(''); continue; }
+      if (/font-size:\s*18px/.test(b)) { out.push('## ' + inlineFromHtml(inner.replace(/<\/?b>/g, ''))); out.push(''); continue; }
+      let text = inlineFromHtml(inner);
+      if (text.replace(/\*\*/g, '').trim() === '') text = '';       // 空加粗残留
+      out.push(text);
+    }
+    while (out.length && out[out.length - 1] === '') out.pop();
+    return out.join('\n').replace(/\n{3,}/g, '\n\n') + '\n';
+  }
+  function exportOne(meta, bodyHtml, outDir, used) {
+    const iso = t => t ? String(t).slice(0, 10) : null;
+    const tag = f => f.split('/')[0].replace(/\s+/g, '');
+    const fm = [
+      '---', 'title: ' + meta.name,
+      'created: ' + iso(meta.created), 'modified: ' + iso(meta.modified),
+      'source: apple-notes://' + meta.id.replace('x-coredata://', ''),
+      'tags: [apple-notes' + (meta.folder ? ', ' + tag(meta.folder) : '') + ']',
+      '---', '',
+    ].join('\n');
+    const md = fm + htmlToMd(bodyHtml, meta.name);
+    let base = meta.name.replace(/^#+\s*/, '').replace(/[\\/:*?"<>|#^[\]]/g, '_').trim() || 'untitled';
+    if (used.has(base)) { let k = 2; while (used.has(base + ' ' + k)) k++; base = base + ' ' + k; }
+    used.add(base);
+    const path = outDir.replace(/\/$/, '') + '/' + base + '.md';
+    const ns = $.NSString.alloc.initWithUTF8String(md);
+    if (!ns.writeToFileAtomicallyEncodingError(path, true, $.NSUTF8StringEncoding, null)) {
+      throw '[mac-notes] 写入失败: ' + path;
+    }
+    return path;
+  }
+  function ensureOutDir(dir) {
+    let d = String(dir);
+    if (d.startsWith('~/')) d = $.NSHomeDirectory().js + d.slice(1);
+    if (d[0] !== '/') {
+      const cur = Application.currentApplication(); cur.includeStandardAdditions = true;
+      d = String(cur.doShellScript('pwd')).replace(/\n$/, '') + '/' + d;
+    }
+    const fmgr = $.NSFileManager.defaultManager;
+    try { fmgr.createDirectoryAtPathWithIntermediateDirectoriesAttributesError(d, true, null, null); }
+    catch (e) {
+      const cur = Application.currentApplication(); cur.includeStandardAdditions = true;
+      cur.doShellScript('mkdir -p ' + "'" + d.replace(/'/g, "'\\''") + "'");
+    }
+    return d;
+  }
+
+  const acct = account(rest.includes('--account') ? rest[rest.indexOf('--account') + 1] : null);
+
+  // ---------- 命令分发 ----------
+  let result;
+  switch (cmd) {
+
+    case 'folders': {
+      const o = parse(rest, new Set(['--account']));
+      const { list } = folderData(acct);
+      const visible = list.filter(f => (o['--all'] ? true : !f.inTrash));
+      result = visible.map(f => ({ id: f.id, name: f.name, path: f.path, noteCount: f.noteCount }));
+      break;
+    }
+
+    case 'list': {
+      const o = parse(rest, new Set(['--account', '--folder', '--limit']));
+      let notes = collectNotes(acct, { folderPath: o['--folder'] || null });
+      notes.sort((a, b) => String(b.modified || '').localeCompare(String(a.modified || '')));
+      const limit = Math.max(1, parseInt(o['--limit'] || '50', 10) || 50);
+      result = { total: notes.length, showing: Math.min(notes.length, limit), notes: notes.slice(0, limit) };
+      break;
+    }
+
+    case 'search': {
+      const o = parse(rest, new Set(['--account', '--folder', '--limit']));
+      const q = o._.join(' ');
+      if (!q) throw '[mac-notes] search 需要搜索词, 例: notes search 关键词';
+      const ql = q.toLowerCase();
+      const notes = collectNotes(acct, {
+        folderPath: o['--folder'] || null,
+        includeDeleted: !!o['--deleted'],
+        withText: true,
+      });
+      const hits = [];
+      for (const n of notes) {
+        if (n.locked) continue;
+        const nameHit = n.name.toLowerCase().includes(ql);
+        const idx = (n.text || '').toLowerCase().indexOf(ql);
+        if (!nameHit && idx < 0) continue;
+        let snippet = null;
+        if (idx >= 0) {
+          const s = Math.max(0, idx - 40);
+          snippet = (s > 0 ? '…' : '') + n.text.slice(s, idx + q.length + 80).replace(/\s+/g, ' ') + '…';
+        }
+        hits.push({
+          id: n.id, name: n.name, folder: n.folder, modified: n.modified,
+          matched: nameHit ? 'title' : 'body', snippet,
+        });
+      }
+      hits.sort((a, b) => String(b.modified || '').localeCompare(String(a.modified || '')));
+      const limit = Math.max(1, parseInt(o['--limit'] || '50', 10) || 50);
+      result = { query: q, total: hits.length, showing: Math.min(hits.length, limit), results: hits.slice(0, limit) };
+      break;
+    }
+
+    case 'show': {
+      const o = parse(rest, new Set(['--account']));
+      if (!o._.length) throw '[mac-notes] show 需要 <id|标题>';
+      const { spec, meta } = findNote(acct, o._[0], { includeDeleted: true });
+      const out = {
+        id: meta.id, name: meta.name, folder: meta.folder,
+        created: meta.created, modified: meta.modified, locked: meta.locked,
+      };
+      if (meta.locked) {
+        out.text = '';
+        out.hint = '此笔记已锁定 (密码保护), 脚本无法读取正文。';
+      } else {
+        out.text = String(spec.plaintext());
+        if (o['--html']) out.html = String(spec.body());
+      }
+      result = out;
+      break;
+    }
+
+    case 'create': {
+      const o = parse(rest, new Set(['--account', '--title', '--text', '--folder']));
+      const title = o['--title'];
+      if (!title) throw '[mac-notes] create 需要 --title "标题" (备忘录会自动把标题作为正文第一行, --text 里不要再写标题)';
+      const folder = o['--folder'] ? resolveFolder(acct, o['--folder']) : defaultNotesFolder(acct);
+      const props = { name: title };
+      if (o['--text'] !== undefined) props.body = textToHtml(o['--text']);
+      const note = App.make({ new: 'note', at: folder.spec, withProperties: props });
+      result = { id: String(note.id()), name: String(note.name()), folder: folder.path };
+      break;
+    }
+
+    case 'append': {
+      const o = parse(rest, new Set(['--account', '--text']));
+      if (o['--text'] === undefined) throw '[mac-notes] append 需要 --text "追加内容"';
+      if (!o._.length) throw '[mac-notes] append 需要 <id|标题>';
+      const { spec, meta } = findNote(acct, o._[0]);
+      if (meta.locked) throw '[mac-notes] 笔记已锁定, 无法修改';
+      spec.body = String(spec.body()) + '\n' + textToHtml(o['--text']);
+      result = { id: meta.id, name: meta.name, appended: true };
+      break;
+    }
+
+    case 'set-text': {
+      const o = parse(rest, new Set(['--account', '--text']));
+      if (o['--text'] === undefined) throw '[mac-notes] set-text 需要 --text "新正文"';
+      if (!o._.length) throw '[mac-notes] set-text 需要 <id|标题>';
+      const { spec, meta } = findNote(acct, o._[0]);
+      if (meta.locked) throw '[mac-notes] 笔记已锁定, 无法修改';
+      const { head } = splitTitle(spec.body());
+      spec.body = (head || '<div>' + esc(meta.name) + '</div>') + '\n' + textToHtml(o['--text']);
+      result = { id: meta.id, name: meta.name, replaced: true, keptTitle: true };
+      break;
+    }
+
+    case 'apply-markdown': {
+      const o = parse(rest, new Set(['--account', '--file', '--text']));
+      const md = o['--file'] !== undefined ? readMdFile(o['--file']) : o['--text'];
+      if (md === undefined) throw '[mac-notes] apply-markdown 需要 --file <md文件路径> 或 --text "<markdown文本>"';
+      if (!o._.length) throw '[mac-notes] apply-markdown 需要 <id|标题>';
+      const { spec, meta } = findNote(acct, o._[0]);
+      if (meta.locked) throw '[mac-notes] 笔记已锁定, 无法修改';
+      const html = mdToHtml(md, meta.name);
+      if (o['--append']) {
+        spec.body = String(spec.body()) + '\n' + html;
+      } else {
+        const { head } = splitTitle(spec.body());
+        spec.body = (head || '<div>' + esc(meta.name) + '</div>') + '\n' + html;
+      }
+      result = { id: meta.id, name: meta.name, applied: 'markdown→富文本', mode: o['--append'] ? 'append' : 'replace(保留标题)' };
+      break;
+    }
+
+    case 'rename': {
+      const o = parse(rest, new Set(['--account', '--title']));
+      const t = o['--title'];
+      if (!t) throw '[mac-notes] rename 需要 --title "新标题"';
+      if (!o._.length) throw '[mac-notes] rename 需要 <id|标题>';
+      const { spec, meta } = findNote(acct, o._[0]);
+      if (meta.locked) throw '[mac-notes] 笔记已锁定, 无法修改';
+      // 标题 = 正文第一行: 改写 body 首个 <div>, name 会自动同步 (只改 name 会造成脱钩)
+      const { head, rest: bodyRest } = splitTitle(spec.body());
+      const isH1 = /<h1>/i.test(head);
+      const newHead = '<div>' + (isH1 ? '<h1>' + esc(t) + '</h1>' : esc(t)) + '</div>';
+      spec.body = newHead + (bodyRest || '');
+      try { spec.name = t; } catch (e) { /* name 会随 body 同步, 失败可忽略 */ }
+      result = { id: meta.id, oldName: meta.name, newName: t };
+      break;
+    }
+
+    case 'mkdir': {
+      const o = parse(rest, new Set(['--account']));
+      const path = o._.join(' ');
+      if (!path) throw '[mac-notes] mkdir 需要文件夹路径, 例: notes mkdir 项目/2026';
+      const segs = path.split('/').map(s => s.trim()).filter(Boolean);
+      if (!segs.length) throw '[mac-notes] 文件夹路径无效';
+      const { list, specById } = folderData(acct);
+      let curPath = '';
+      let parentSpec = null; // null = 账户根
+      const createdPaths = [];
+      for (const seg of segs) {
+        curPath = curPath ? curPath + '/' + seg : seg;
+        const existing = list.find(f => !f.inTrash && f.path === curPath);
+        if (existing) { parentSpec = specById.get(existing.id); continue; }
+        parentSpec = App.make({ new: 'folder', at: parentSpec || acct, withProperties: { name: seg } });
+        createdPaths.push(curPath);
+        list.push({ path: curPath });
+      }
+      result = { path: curPath, created: createdPaths };
+      break;
+    }
+
+    case 'move': {
+      const o = parse(rest, new Set(['--account', '--folder']));
+      if (!o['--folder']) throw '[mac-notes] move 需要 --folder "目标文件夹" (不存在可先 mkdir)';
+      if (!o._.length) throw '[mac-notes] move 需要 <id|标题>';
+      const target = resolveFolder(acct, o['--folder']);
+      const { spec, meta } = findNote(acct, o._[0]);
+      App.move(spec, { to: target.spec });
+      result = { id: meta.id, name: meta.name, from: meta.folder, to: target.path };
+      break;
+    }
+
+    case 'delete': {
+      const o = parse(rest, new Set(['--account']));
+      if (!o._.length) throw '[mac-notes] delete 需要 <id|标题>';
+      const { spec, meta } = findNote(acct, o._[0]);
+      if (meta.folder === 'Recently Deleted' || meta.folder.startsWith('Recently Deleted/')) {
+        throw '[mac-notes] 此笔记已在「最近删除」中。脚本无法从最近删除里彻底删除, 请在备忘录 App 里手动处理。';
+      }
+      App.delete(spec);
+      result = { deleted: meta.name, where: '最近删除 (30 天后自动清除, 可在 App 中恢复)' };
+      break;
+    }
+
+    case 'delete-folder': {
+      const o = parse(rest, new Set(['--account']));
+      const key = o._.join(' ');
+      if (!key) throw '[mac-notes] delete-folder 需要 <路径|id>';
+      const { list, specById } = folderData(acct);
+      const f = list.find(x => x.id === key && !x.inTrash)
+             || list.find(x => !x.inTrash && x.path === key)
+             || list.find(x => !x.inTrash && x.name === key);
+      if (!f) throw `[mac-notes] 文件夹不存在: ${key}`;
+      const desc = list.filter(x => x.inTrash === false && x.path.startsWith(f.path + '/'));
+      const allNotes = collectNotes(acct, { folderPath: f.path });
+      if ((allNotes.length || desc.length) && !o['--force']) {
+        throw `[mac-notes] 文件夹「${f.path}」含 ${allNotes.length} 条笔记、${desc.length} 个子文件夹。确认删除请加 --force (笔记移入最近删除)。`;
+      }
+      // 自底向上: 先笔记, 再子文件夹 (深→浅), 最后本体
+      for (const n of allNotes) {
+        try { App.delete(specById.get(n.folderId).notes.byId(n.id)); } catch (e) {}
+      }
+      desc.sort((a, b) => b.depth - a.depth);
+      for (const d of desc) { try { App.delete(specById.get(d.id)); } catch (e) {} }
+      try { App.delete(specById.get(f.id)); } catch (e) {}
+      const still = folderData(acct).list.some(x => !x.inTrash && x.path === f.path);
+      result = {
+        deletedFolder: f.path, notes: allNotes.length, subfolders: desc.length,
+        warning: still ? '删除指令已发出, 但文件夹仍出现在列表中 (iCloud 同步可能有延迟), 请稍后用 folders 命令核实。' : undefined,
+      };
+      break;
+    }
+
+    case 'export': {
+      const o = parse(rest, new Set(['--account', '--out', '--folder']));
+      if (!o['--folder'] && !o._.length) throw '[mac-notes] export 需要 <id|标题> (单篇) 或 --folder F (批量)';
+      const outDir = ensureOutDir(o['--out'] || '.');
+      const used = new Set();
+      if (o['--folder']) {
+        const fp = o['--folder'];
+        resolveFolder(acct, fp);   // 校验存在
+        const { list, specById } = folderData(acct);
+        const targets = list.filter(f => !f.inTrash && inScope(f.path, fp));
+        const files = [];
+        let failed = 0;
+        for (const f of targets) {
+          const fspec = specById.get(f.id);
+          const safeBatch = (prop, fb) => {
+            try { return Array.from(fspec.notes[prop]()); } catch (e) {
+              return fspec.notes().map(s => { try { return s[prop](); } catch (e2) { return fb; } });
+            }
+          };
+          const ids = safeBatch('id', null).map(x => x === null ? null : String(x));
+          const names = safeBatch('name', '?');
+          const created = safeBatch('creationDate', null);
+          const modified = safeBatch('modificationDate', null);
+          const locked = safeBatch('passwordProtected', false);
+          const bodies = safeBatch('body', '');
+          ids.forEach((id, i) => {
+            if (!id) { failed++; return; }
+            const meta = { id, name: String(names[i]), folder: f.path,
+              created: created[i] ? new Date(created[i]).toISOString() : null,
+              modified: modified[i] ? new Date(modified[i]).toISOString() : null };
+            if (!!locked[i]) { failed++; return; }   // 锁定笔记跳过
+            try { files.push(exportOne(meta, String(bodies[i]), outDir, used)); }
+            catch (e) { failed++; }
+          });
+        }
+        result = { folder: fp, exported: files.length, skippedOrFailed: failed, outDir, files };
+      } else {
+        const { spec, meta } = findNote(acct, o._[0], { includeDeleted: true });
+        if (meta.locked) throw '[mac-notes] 笔记已锁定, 无法导出';
+        const path = exportOne(meta, String(spec.body()), outDir, used);
+        result = { exported: 1, file: path };
+      }
+      break;
+    }
+
+    case 'open': {
+      const o = parse(rest, new Set(['--account']));
+      if (!o._.length) throw '[mac-notes] open 需要 <id|标题>';
+      const { spec, meta } = findNote(acct, o._[0], { includeDeleted: true });
+      App.activate();
+      App.show(spec);
+      result = { opened: meta.name, id: meta.id, folder: meta.folder };
+      break;
+    }
+
+    default:
+      throw `[mac-notes] 未知命令: ${cmd} (运行 notes help 查看)`;
+  }
+
+  return JSON.stringify(result, null, 2);
+}

@@ -1,4 +1,0 @@
-interface:
-  display_name: "Apple Notes"
-  short_description: "Read, edit, organize and export Apple Notes on your Mac"
-  default_prompt: "Use $apple-notes to find and update my Apple Notes."

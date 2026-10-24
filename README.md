@@ -1,69 +1,87 @@
-# Apple Notes Agent Skill
+# mac-notes — Apple Notes agent skill（零依赖）
 
-让 Claude、Codex 和其他本地 agent 直接使用 Mac 上的**苹果备忘录**：读取、搜索、创建、编辑、整理和导出。
+让 ZCode / Claude Code / Codex / Cursor 等任何本地 agent 直接操控 Mac 备忘录：**整理、搜索、撰写、富排版、导出**。单文件 JXA CLI，无 Node、无 MCP、无 Full Disk Access，输出 JSON。
 
-基于 [sweetrb/apple-notes-mcp](https://github.com/sweetrb/apple-notes-mcp)，封装成容易安装的通用 Agent Skill。**不需要独立 App、模型 API Key、sudo 或全局 npm 安装。**
+> **v2.0.0**：完全重写。v1 基于 pinned MCP 后端（apple-notes-mcp + Node 运行时 + npm lockfile），依赖重、安装链路长；v2 换成零依赖单文件方案，接口怪癖全部实测沉淀。能力对照见下文。
 
-## 把这段话发给你的 agent
-
-```text
-请阅读 https://github.com/YuanyuanMa03/apple-notes-agent-skill/blob/main/INSTALL.md，
-在我的 Mac 上为当前 agent 安装 Apple Notes 技能，并完成安装和只读连接检查。
-保留我现有的技能和配置。若 macOS 需要我手动授权，请告诉我具体要点哪个开关；
-授权后继续验证，不要把“文件已安装”当作“全部功能可用”。
-```
-
-安装后直接说：
-
-- “找一下我在备忘录里记过的项目决定。”
-- “把这段内容保存到工作文件夹，标题叫今天的会议记录。”
-- “给这篇备忘录追加下一步计划。”
-- “把这几篇笔记移到归档文件夹。”
-- “把这篇备忘录连同附件导出为 Markdown。”
-
-首次系统授权需要用户点击，无法用 prompt 绕过。普通脚本操作需要 Automation → Notes；原生结构读取、许多已有笔记的安全编辑和便携导出还需要完整磁盘访问。高级原生操作按需导入快捷指令。
-
-## 也可以自己安装
+## 安装
 
 ```sh
 git clone https://github.com/YuanyuanMa03/apple-notes-agent-skill.git
 cd apple-notes-agent-skill
-bash install.sh --target auto
+bash install.sh            # 装到 ~/.agents/skills/mac-notes (跨工具通用目录)
 ```
 
-`auto` 根据当前 agent 环境选择目标，无法识别时安装到通用 `~/.agents/skills/apple-notes`。可指定 `codex`、`claude-code`、`cursor`、`claude-desktop` 或 `generic`，多个目标用逗号分隔。Claude Desktop 自动配置本地 MCP；其他目标默认使用 Skill + CLI。
+可选目标：`bash install.sh zcode`（~/.zcode/skills）、`bash install.sh claude`（~/.claude/skills）、`bash install.sh /任意/路径`。
 
-优先复用 Node 20+；缺少时从 Node 官方下载并校验 Node 24，装到用户目录。后端固定为 **apple-notes-mcp 2.15.10**，MCP SDK 固定为 **1.32.1**，依赖使用 lockfile 安装并禁用生命周期脚本。
+**首次运行**会触发 macOS 授权弹窗「…想要控制"备忘录"」→ 点**允许**。若曾被拒绝：系统设置 → 隐私与安全性 → 自动化 → 勾选你的终端 App 下的「备忘录」。
 
-## 能力与边界
+## 命令速查（16 个）
 
-| 能力 | 说明 |
+| 命令 | 作用 |
 |---|---|
-| 读取与搜索 | 账号、文件夹、标题/正文搜索，Markdown/HTML/纯文本读取 |
-| 创建与编辑 | 创建、追加和受保护的正文更新；保留内容版本检查 |
-| 整理 | 创建文件夹、移动、标签、置顶等；原生功能按能力检查结果提供 |
-| 附件与导出 | 附件读取/保存，按笔记或文件夹导出 Markdown、HTML、JSON |
-| 原生内容 | 结构读取、表格/清单创建等；需要相应权限与快捷指令 |
-| 明确限制 | 不提供已有原生表格单元格的后台编辑、已有清单勾选切换、解锁或协作权限管理；不绕过保真保护 |
+| `folders [--all]` | 文件夹树（path、noteCount） |
+| `list [--folder F]` | 笔记列表，按修改时间倒序 |
+| `search <词> [--folder F] [--deleted]` | 全文搜索（标题+正文），带摘要 |
+| `show <id\|标题> [--html]` | 读笔记（纯文本 / 原始 HTML） |
+| `open <id\|标题>` | 在备忘录 App 中打开定位 |
+| `create --title T [--text X] [--folder F]` | 新建笔记 |
+| `append <id\|标题> --text X` | 末尾追加 |
+| `set-text <id\|标题> --text X` | 整体替换正文（保留标题） |
+| `apply-markdown <id\|标题> (--file F\|--text M) [--append]` | **Markdown → 备忘录富文本**（真表格/原生列表/标题样式/加粗） |
+| `rename <id\|标题> --title T` | 改名（标题与正文首行双向同步） |
+| `mkdir <路径>` | 建文件夹（支持 `父/子` 嵌套） |
+| `move <id\|标题> --folder F` | 移动笔记 |
+| `delete <id\|标题>` | 删除 → 最近删除（30 天，可恢复） |
+| `delete-folder <路径> [--force]` | 删文件夹（非空需 `--force`，自底向上删） |
+| `export <id\|标题> [--out 目录]` | 单篇导出为 Obsidian 格式 .md |
+| `export --folder F [--out 目录]` | 批量导出整个文件夹 |
 
-Skill + CLI 可在当前会话立即使用，不必等待 MCP 工具重新发现。只支持本机 Mac 上能够执行本地命令或启动本地 stdio MCP 的 agent；上传到云端容器不会获得本机备忘录访问能力。
-
-## 安装管理
-
-CLI 默认位于 `~/.local/bin/notes-agent`。PATH 未包含该目录时，使用安装结果给出的绝对路径。
+成功输出 JSON（exit 0），失败输出 `[mac-notes] …` 及下一步建议（exit 1）。`<id|标题>` 优先用 id，标题唯一时可直接用标题，重名报错并列出候选。
 
 ```sh
-notes-agent doctor
-notes-agent capabilities
-notes-agent tools search-notes
-notes-agent setup shortcuts        # 仅在需要原生高级功能时
-notes-agent install --target claude-code
-notes-agent uninstall              # 保留运行时缓存、用户修改和全部笔记
-notes-agent uninstall --purge      # 另删本包管理的后端运行时
+NOTES=~/.agents/skills/mac-notes/scripts/notes
+"$NOTES" search 水稻土                                # 全文搜索
+"$NOTES" create --title "组会纪要" --text "要点…" --folder "科研"
+"$NOTES" apply-markdown "组会纪要" --text "## 结论"$'\n'"- 项目可行"   # 富排版写入
+"$NOTES" export --folder "科研" --out ~/Documents      # 导出为 Obsidian md
 ```
 
-升级：获取新版本源码后重新运行 `bash install.sh --target auto`。同名外部技能、手动修改过的安装文件和配置冲突会保留并报告。JSON 配置修改前有备份，卸载只移除本包的 MCP 项。
+## 设计原理（为什么这些命令长这样）
 
-[Agent 安装指引](INSTALL.md) · [使用与兼容说明](docs/usage.md) · [技能正文](skills/apple-notes/SKILL.md) · [MIT License](LICENSE) · [上游声明](NOTICE)
+全部接口行为在 macOS 26.7.1 上实测得出，细节见 [skills/mac-notes/references/quirks.md](skills/mac-notes/references/quirks.md)：
 
-English: A portable Apple Notes skill for local agents. Give your agent the INSTALL.md link; it installs a pinned backend, a discoverable skill and a shell-to-MCP CLI. macOS privacy grants still require your click.
+- **搜索不用 whose 子句**：`whose` 对新建笔记会报「不能获取对象」且更慢（社区实测慢 6.9×）。改为一次 Apple Event 批量拉属性 + JS 过滤，新建笔记秒级可搜。
+- **标题 = 正文首行**：改写 body 首个 `<div>` 时 name 自动同步；只改 name 会造成 UI 标题与正文脱钩。
+- **富文本走私有 HTML 方言**：表格需包 `<object>` + 内联边框样式、原生虚线列表用 `<ul class="Apple-dash-list">`、标题样式用粗体+字号模拟。
+
+## 边界与限制（Apple 接口墙，非偷懒）
+
+| 不支持 | 原因 |
+|---|---|
+| 置顶 (pin) | macOS 26 上 AppleScript 读写 `pinned` 均报「不能转换类型」，接口损坏 |
+| 原生可打勾清单写入 | body 写入路径会清洗 div class，5 种方言变体实测全部被拍平 |
+| 附件导出 | Notes 脚本接口不暴露附件对象（正文仅显示 `￼` 占位符） |
+| 读取锁定笔记 | 端到端加密，`plaintext` 返回空串（列表标记 `locked: true`） |
+| 彻底清空最近删除 | 对已删除笔记再次 delete 会失败，需在 App 中手动处理 |
+| 语义 Heading 样式 | 写入 h2 会被规范化为「粗体+18px」模拟样式 |
+
+## 兼容性
+
+macOS 26.7.1 (Build 25G241) 单 iCloud 账户全命令实测通过。AppleScript 接口随 macOS 版本漂移，遇到异常优先看 quirks.md。
+
+## v1 → v2
+
+| | v1 (MCP 后端) | v2 (本版) |
+|---|---|---|
+| 依赖 | Node 20+、apple-notes-mcp 2.15.10、MCP SDK、npm lockfile | 无（macOS 自带 osascript） |
+| 权限 | Automation + Full Disk Access (SQLite) + Shortcuts 导入 | 仅 Automation |
+| 安装 | bootstrap 下载 Node → lockfile 安装 → 验收 | 复制 3 个文件 |
+| 定位 | Skill + CLI + 可选原生 MCP | 单文件 CLI + SKILL.md + 实测文档 |
+| skill 名 | `apple-notes` | `mac-notes`（卸载旧版后安装即可迁移） |
+
+v1 的附件导出、原生标签、真 Heading 等能力来自 MCP/SQLite 通道，v2 以零依赖为优先取舍了这些；如需可并行使用 v1。
+
+## License
+
+MIT © YuanyuanMa03
