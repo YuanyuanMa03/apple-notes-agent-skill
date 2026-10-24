@@ -4,6 +4,25 @@
 
 > **v2.0.0**：完全重写。v1 基于 pinned MCP 后端（apple-notes-mcp + Node 运行时 + npm lockfile），依赖重、安装链路长；v2 换成零依赖单文件方案，接口怪癖全部实测沉淀。能力对照见下文。
 
+## 演示：一句话，从网页到结构化笔记
+
+把这段话发给你的 agent（ZCode / Claude Code / Codex / Cursor…）：
+
+> 帮我从网上搜一下 DeepSeek Harness 的系统架构，整理成笔记放到备忘录。
+
+agent 自动触发本 skill，完成 **联网搜索 → 整理成 Markdown → `create` 建笔记 → `apply-markdown` 写成原生富文本 → `open` 打开定位**，全程无需人工干预：
+
+![端到端演示：agent 搜索 DeepSeek Harness 架构后自动写入备忘录](docs/demo-note.png)
+
+上面是真实输出（非效果图摆拍）：agent 检索 [deepseek-ai/deepseek-harness](https://github.com/deepseek-ai/deepseek-harness) 官方架构文档，把「Everything is a Plugin」架构笔记写进「技术知识」文件夹——注意表格、虚线列表、加粗标题都是备忘录**原生富文本**，不是 markdown 源码。
+
+更多一句话用法：
+
+- 「把备忘录里关于会议的笔记都归档到新建的『会议归档』文件夹」
+- 「把『科研』文件夹整个导出成 Obsidian 库」
+- 「给『推拉循环』这篇笔记排个版，开头加个总览表格」
+- 「找一下我记过的健身计划，把今天的训练清单读给我」
+
 ## 安装
 
 ```sh
