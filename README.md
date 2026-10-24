@@ -14,7 +14,7 @@ agent 自动触发本 skill，完成 **联网搜索 → 整理成 Markdown → `
 
 ![端到端演示：agent 搜索 DeepSeek Harness 架构后自动写入备忘录](docs/demo-note.png)
 
-上面是真实输出（非效果图摆拍）：agent 检索 [deepseek-ai/deepseek-harness](https://github.com/deepseek-ai/deepseek-harness) 官方架构文档，把「Everything is a Plugin」架构笔记写进「技术知识」文件夹——注意表格、虚线列表、加粗标题都是备忘录**原生富文本**，不是 markdown 源码。
+上面这张图的笔记内容 100% 来自一次真实运行：agent 检索 [deepseek-ai/deepseek-harness](https://github.com/deepseek-ai/deepseek-harness) 官方架构文档，把「Everything is a Plugin」架构笔记写进「技术知识」文件夹（图为笔记内容的高保真渲染）。注意表格、虚线列表、加粗标题都是备忘录**原生富文本**，不是 markdown 源码。
 
 更多一句话用法：
 
